@@ -97,60 +97,70 @@ def parse_jobs_response(raw_response: Dict) -> Optional[JobSearchResponse]:
 
 def store_jobs_in_db(parsed_response: JobSearchResponse) -> bool:
     """
-    Store job data in MongoDB collections.
-    
-    Args:
-        parsed_response (JobSearchResponse): Validated job search response
-        
-    Returns:
-        bool: True if storage successful, False otherwise
-        
-    Notes:
-        - Stores search metadata in searches collection
-        - Stores individual jobs in jobs collection with search reference
-        - Uses upsert to avoid duplicates
+    Store job data in MongoDB collections with optimized data separation.
     """
     try:
         jobs_collection = get_jobs_collection()
         searches_collection = get_searches_collection()
         current_time = datetime.now(UTC)
         
-        # Store search metadata
-        search_dict = parsed_response.model_dump(exclude={'jobs'})
-        search_id = search_dict['search_metadata']['id']
+        # Create a lean search record with mode='json' for proper serialization
+        search_record = {
+            'search_metadata': {
+                'id': parsed_response.search_metadata.id,
+                'status': parsed_response.search_metadata.status,
+                'created_at': parsed_response.search_metadata.created_at,
+                'total_time_taken': parsed_response.search_metadata.total_time_taken
+            },
+            'search_parameters': parsed_response.search_parameters.model_dump(mode='json'),
+            'search_information': parsed_response.search_information.model_dump(mode='json'),
+            'job_count': len(parsed_response.jobs),
+            'stored_at': current_time
+        }
         
-        searches_collection.update_one(
-            {'search_metadata.id': search_id},
-            {'$set': search_dict},
-            upsert=True
-        )
-        
-        # Store individual jobs with reference to search
-        for job in parsed_response.jobs:
-            job_dict = job.model_dump()
-            job_dict.update({
-                'search_id': search_id,
-                'search_query': parsed_response.search_parameters.q,
-                'fetched_at': current_time,
-                'search_location': parsed_response.search_information.detected_location
-            })
+        try:
+            print("1. Attempting to store search metadata...")
+            search_result = searches_collection.insert_one(search_record)
+            search_id = search_result.inserted_id
+            print(f"2. Successfully stored search metadata with ID: {search_id}")
             
-            jobs_collection.update_one(
-                {
-                    'title': job.title,
-                    'company_name': job.company_name,
-                    'location': job.location,
-                    'apply_link': job.apply_link
-                },
-                {'$set': job_dict},
-                upsert=True
-            )
-        
-        logger.info(f"Successfully stored search data and {len(parsed_response.jobs)} jobs in MongoDB")
-        return True
-        
+            print("3. Attempting to store jobs...")
+            successful_jobs = 0
+            for job in parsed_response.jobs:
+                try:
+                    job_dict = job.model_dump(mode='json')  # Convert HttpUrl to strings
+                    job_dict.update({
+                        'search_id': search_id,
+                        'search_query': parsed_response.search_parameters.q,
+                        'fetched_at': current_time,
+                        'search_location': parsed_response.search_information.detected_location
+                    })
+                    
+                    result = jobs_collection.update_one(
+                        {
+                            'title': job.title,
+                            'company_name': job.company_name,
+                            'location': job.location,
+                            'apply_link': str(job.apply_link)
+                        },
+                        {'$set': job_dict},
+                        upsert=True
+                    )
+                    successful_jobs += 1
+                    print(f"4. Stored job: {job.title} ({job.company_name})")
+                except Exception as job_error:
+                    print(f"Error storing job {job.title}: {str(job_error)}")
+                    continue
+            
+            print(f"5. Successfully stored {successful_jobs}/{len(parsed_response.jobs)} jobs")
+            return successful_jobs > 0
+            
+        except Exception as db_error:
+            print(f"Database operation error: {str(db_error)}")
+            return False
+            
     except Exception as e:
-        logger.error(f"Error storing data in MongoDB: {str(e)}")
+        print(f"General error in store_jobs_in_db: {str(e)}")
         return False
 
 def process_job_search(
