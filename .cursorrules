@@ -1,0 +1,2 @@
+# Environment management
+- don't use 'uv pip install ...' use 'uv add ...'
