@@ -4,8 +4,8 @@ import requests
 import os
 from dotenv import load_dotenv
 from logfire import Logfire
-from backend.database.mongodb import get_jobs_collection, get_searches_collection
-from backend.models.jobs_search_models import JobSearchResponse
+from backend.database.mongodb_jobfocus import get_jobs_collection, get_searches_collection
+from backend.models.job_search_models import JobSearchResponse
 from pydantic import ValidationError
 
 # Initialize logging
