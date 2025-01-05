@@ -11,23 +11,23 @@ from pydantic import ValidationError
 # Initialize logging
 logger = Logfire()
 
-def fetch_job_data(
+def fetch_jobs_from_api(
     job_title: str,
     job_location: Optional[str] = None,
     search_location: Optional[str] = None,
     next_page_token: Optional[str] = None
 ) -> Optional[Dict]:
     """
-    Fetch job listings using SearchAPI.io's Google Jobs API
+    Fetch raw job data from SearchAPI.io.
     
     Args:
-        job_title (str): Job title or search query
-        job_location (str, optional): Location to include in search query
-        search_location (str, optional): Location parameter for API
-        next_page_token (str, optional): Token for pagination
+        job_title (str): The job title or search query
+        job_location (Optional[str]): Location to include in search query
+        search_location (Optional[str]): Location parameter for API geotargeting
+        next_page_token (Optional[str]): Token for pagination
         
     Returns:
-        Optional[Dict]: Parsed JSON response containing job listings or None if error occurs
+        Optional[Dict]: Raw API response data or None if request fails
         
     Raises:
         requests.RequestException: If API request fails
@@ -64,15 +64,19 @@ def fetch_job_data(
         logger.error(f"Error fetching job data: {str(e)}")
         return None
 
-def parse_job_response(raw_response: Dict) -> Optional[JobSearchResponse]:
+def parse_jobs_response(raw_response: Dict) -> Optional[JobSearchResponse]:
     """
-    Parse raw API response into JobSearchResponse model
+    Parse raw API response into structured job data.
     
     Args:
-        raw_response (Dict): Raw JSON response from the API
+        raw_response (Dict): Raw API response data
         
     Returns:
-        Optional[JobSearchResponse]: Parsed response or None if parsing fails
+        Optional[JobSearchResponse]: Parsed job response object or None if parsing fails
+        
+    Notes:
+        - Stores pagination token as '_next_page_token' attribute
+        - Validates response against JobSearchResponse model
     """
     try:
         # Remove pagination from raw response before parsing
@@ -91,41 +95,20 @@ def parse_job_response(raw_response: Dict) -> Optional[JobSearchResponse]:
             logger.error(f"Validation errors: {e.errors()}")
         return None
 
-def fetch_and_parse_jobs(
-    job_title: str,
-    job_location: Optional[str] = None,
-    search_location: Optional[str] = None,
-    next_page_token: Optional[str] = None,
-    search_level: int = 1  # Only used for logging and state tracking
-) -> Optional[JobSearchResponse]:
+def store_jobs_in_db(parsed_response: JobSearchResponse) -> bool:
     """
-    Fetch and parse job listings
+    Store job data in MongoDB collections.
     
     Args:
-        job_title (str): Job title or search query
-        job_location (str, optional): Location to include in search query
-        search_location (str, optional): Location parameter for API
-        next_page_token (str, optional): Token for pagination
-        search_level (int): Current level of search pagination (used for tracking only)
+        parsed_response (JobSearchResponse): Validated job search response
         
     Returns:
-        Optional[JobSearchResponse]: Parsed job search response
-    """
-    raw_response = fetch_job_data(
-        job_title=job_title,
-        job_location=job_location,
-        search_location=search_location,
-        next_page_token=next_page_token
-    )
-    
-    if not raw_response:
-        return None
+        bool: True if storage successful, False otherwise
         
-    return parse_job_response(raw_response)  # Remove search_level addition but keep type hints
-
-def store_job_results(parsed_response: JobSearchResponse) -> bool:
-    """
-    Store job search results in MongoDB, splitting between searches and jobs collections
+    Notes:
+        - Stores search metadata in searches collection
+        - Stores individual jobs in jobs collection with search reference
+        - Uses upsert to avoid duplicates
     """
     try:
         jobs_collection = get_jobs_collection()
@@ -169,3 +152,52 @@ def store_job_results(parsed_response: JobSearchResponse) -> bool:
     except Exception as e:
         logger.error(f"Error storing data in MongoDB: {str(e)}")
         return False
+
+def process_job_search(
+    job_title: str,
+    job_location: Optional[str] = None,
+    search_location: Optional[str] = None,
+    next_page_token: Optional[str] = None,
+) -> tuple[Optional[JobSearchResponse], bool]:
+    """
+    Execute complete job search workflow: fetch, parse, and store jobs.
+    
+    This function orchestrates the entire job search process by:
+    1. Fetching raw data from the API
+    2. Parsing and validating the response
+    3. Storing results in MongoDB
+    
+    Args:
+        job_title (str): Job title or search query
+        job_location (Optional[str]): Location to include in search query
+        search_location (Optional[str]): Location parameter for API
+        next_page_token (Optional[str]): Token for pagination
+        
+    Returns:
+        tuple[Optional[JobSearchResponse], bool]: Tuple containing:
+            - Parsed job response (or None if failed)
+            - Boolean indicating if storage was successful
+            
+    Example:
+        >>> response, success = process_job_search(
+        ...     job_title="Python Developer",
+        ...     job_location="San Francisco"
+        ... )
+        >>> if success:
+        ...     print(f"Found {len(response.jobs)} jobs")
+    """
+    raw_response = fetch_jobs_from_api(
+        job_title=job_title,
+        job_location=job_location,
+        search_location=search_location,
+        next_page_token=next_page_token
+    )
+    
+    if not raw_response:
+        return None, False
+        
+    parsed_response = parse_jobs_response(raw_response)
+    if not parsed_response:
+        return None, False
+        
+    return parsed_response, store_jobs_in_db(parsed_response)

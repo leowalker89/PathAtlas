@@ -91,6 +91,47 @@ class MongoDB:
             self._client.close()
             self._client = None
             logger.info("MongoDB connection closed")
+    
+    def ensure_indexes(self):
+        """
+        Create recommended indexes for job-related collections.
+        
+        Creates indexes for job deduplication, search references, timestamps,
+        and search metadata to optimize query performance.
+        
+        Returns:
+            bool: True if indexes created successfully, False otherwise
+        """
+        try:
+            jobs_collection = self.get_collection('jobs_db', 'job_listings')
+            searches_collection = self.get_collection('jobs_db', 'job_searches')
+            
+            # 1. Compound unique index for job deduplication
+            jobs_collection.create_index([
+                ('title', 1),
+                ('company_name', 1),
+                ('location', 1),
+                ('apply_link', 1)
+            ], unique=True)
+            
+            # 2. Search reference index
+            jobs_collection.create_index([('search_id', 1)])
+            
+            # 3. Timestamp index for chronological queries
+            jobs_collection.create_index([('fetched_at', -1)])
+            
+            # 4. Search metadata unique index
+            searches_collection.create_index(
+                [('search_metadata.id', 1)], 
+                unique=True
+            )
+            
+            logger.info("MongoDB indexes created successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to create MongoDB indexes: {str(e)}")
+            return False
 
 # Create a global instance
 mongodb = MongoDB()
