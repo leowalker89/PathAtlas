@@ -68,3 +68,16 @@ class JobSearchResponse(BaseModel):
     search_parameters: SearchParameters
     search_information: SearchInformation
     jobs: List[JobListing]
+    pagination: Optional[dict] = None  # Add pagination info
+    is_subsequent_page: bool = False   # Flag to indicate if this is a subsequent page
+
+class JobSearchDocument(BaseModel):
+    """MongoDB document for storing complete job search results"""
+    search_metadata: SearchMetadata
+    search_parameters: SearchParameters
+    search_information: SearchInformation
+    total_jobs: int = 0
+    pages_processed: int = 0
+    jobs: List[str] = []  # List of job IDs that were found in this search
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)

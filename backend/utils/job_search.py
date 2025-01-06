@@ -1,16 +1,21 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from datetime import datetime, UTC
 import requests
 import os
 from dotenv import load_dotenv
 from logfire import Logfire
 from backend.database.mongodb_jobfocus import get_jobs_collection, get_searches_collection
-from backend.models.job_search_models import JobSearchResponse
+from backend.models.job_search_models import JobSearchResponse, JobSearchDocument
 from pydantic import ValidationError
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Initialize logging
 logger = Logfire()
 
+@retry(
+    stop=stop_after_attempt(3),  # Give up after 3 attempts
+    wait=wait_exponential(multiplier=1, min=4, max=10)  # Wait 4-10 seconds between retries
+)
 def fetch_jobs_from_api(
     job_title: str,
     job_location: Optional[str] = None,
@@ -61,8 +66,8 @@ def fetch_jobs_from_api(
         return response.json()
         
     except requests.RequestException as e:
-        logger.error(f"Error fetching job data: {str(e)}")
-        return None
+        logger.error(f"API request failed: {str(e)}")
+        raise  # Tenacity will catch this and retry
 
 def parse_jobs_response(raw_response: Dict) -> Optional[JobSearchResponse]:
     """
@@ -95,119 +100,145 @@ def parse_jobs_response(raw_response: Dict) -> Optional[JobSearchResponse]:
             logger.error(f"Validation errors: {e.errors()}")
         return None
 
-def store_jobs_in_db(parsed_response: JobSearchResponse) -> bool:
-    """
-    Store job data in MongoDB collections with optimized data separation.
-    """
+def store_jobs_in_db(parsed_response: JobSearchResponse, search_id: Optional[str] = None) -> bool:
+    """Store jobs in MongoDB, updating existing search if search_id provided"""
+    start_time = datetime.now(UTC)
     try:
-        jobs_collection = get_jobs_collection()
-        searches_collection = get_searches_collection()
-        current_time = datetime.now(UTC)
+        job_collection = get_jobs_collection()
+        search_collection = get_searches_collection()
         
-        # Create a lean search record with mode='json' for proper serialization
-        search_record = {
-            'search_metadata': {
-                'id': parsed_response.search_metadata.id,
-                'status': parsed_response.search_metadata.status,
-                'created_at': parsed_response.search_metadata.created_at,
-                'total_time_taken': parsed_response.search_metadata.total_time_taken
-            },
-            'search_parameters': parsed_response.search_parameters.model_dump(mode='json'),
-            'search_information': parsed_response.search_information.model_dump(mode='json'),
-            'job_count': len(parsed_response.jobs),
-            'stored_at': current_time
-        }
+        successful_jobs = 0
+        job_ids = []
         
-        try:
-            print("1. Attempting to store search metadata...")
-            search_result = searches_collection.insert_one(search_record)
-            search_id = search_result.inserted_id
-            print(f"2. Successfully stored search metadata with ID: {search_id}")
+        # Store individual jobs
+        for job in parsed_response.jobs:
+            try:
+                # Convert to dict and ensure URLs are strings
+                job_dict = job.model_dump()
+                job_dict["apply_link"] = str(job.apply_link)
+                job_dict["sharing_link"] = str(job.sharing_link)
+                job_dict["apply_links"] = [{"link": str(link.link), "source": link.source} for link in job.apply_links]
+                job_dict["search_id"] = search_id or parsed_response.search_metadata.id
+                job_dict["created_at"] = datetime.now(UTC)
+                
+                result = job_collection.update_one(
+                    {
+                        "title": job.title,
+                        "company_name": job.company_name,
+                        "location": job.location,
+                        "apply_link": str(job.apply_link)
+                    },
+                    {"$set": job_dict},
+                    upsert=True
+                )
+                
+                if result.upserted_id:
+                    job_ids.append(str(result.upserted_id))
+                
+                successful_jobs += 1
+                
+            except Exception as e:
+                print(f"Error storing job {job.title}: {str(e)}")
+                continue
+        
+        # Handle search document
+        if not parsed_response.is_subsequent_page:
+            search_doc = JobSearchDocument(
+                search_metadata=parsed_response.search_metadata,
+                search_parameters=parsed_response.search_parameters,
+                search_information=parsed_response.search_information,
+                total_jobs=len(parsed_response.jobs),
+                pages_processed=1,
+                jobs=job_ids
+            )
+            search_dict = search_doc.model_dump()
+            # Convert URLs in metadata to strings
+            search_dict["search_metadata"]["request_url"] = str(search_doc.search_metadata.request_url)
+            search_dict["search_metadata"]["html_url"] = str(search_doc.search_metadata.html_url)
+            search_dict["search_metadata"]["json_url"] = str(search_doc.search_metadata.json_url)
             
-            print("3. Attempting to store jobs...")
-            successful_jobs = 0
-            for job in parsed_response.jobs:
-                try:
-                    job_dict = job.model_dump(mode='json')  # Convert HttpUrl to strings
-                    job_dict.update({
-                        'search_id': search_id,
-                        'search_query': parsed_response.search_parameters.q,
-                        'fetched_at': current_time,
-                        'search_location': parsed_response.search_information.detected_location
-                    })
-                    
-                    result = jobs_collection.update_one(
-                        {
-                            'title': job.title,
-                            'company_name': job.company_name,
-                            'location': job.location,
-                            'apply_link': str(job.apply_link)
-                        },
-                        {'$set': job_dict},
-                        upsert=True
-                    )
-                    successful_jobs += 1
-                    print(f"4. Stored job: {job.title} ({job.company_name})")
-                except Exception as job_error:
-                    print(f"Error storing job {job.title}: {str(job_error)}")
-                    continue
-            
-            print(f"5. Successfully stored {successful_jobs}/{len(parsed_response.jobs)} jobs")
-            return successful_jobs > 0
-            
-        except Exception as db_error:
-            print(f"Database operation error: {str(db_error)}")
-            return False
-            
-    except Exception as e:
-        print(f"General error in store_jobs_in_db: {str(e)}")
+            search_collection.insert_one(search_dict)
+        else:
+            search_collection.update_one(
+                {"search_metadata.id": search_id},
+                {
+                    "$inc": {
+                        "total_jobs": len(parsed_response.jobs),
+                        "pages_processed": 1
+                    },
+                    "$push": {"jobs": {"$each": job_ids}},
+                    "$set": {"updated_at": datetime.now(UTC)}
+                }
+            )
+        
+        print(f"Successfully stored {successful_jobs} jobs")
+        logger.info(f"Pipeline metrics: "
+                   f"processed={len(parsed_response.jobs)}, "
+                   f"stored={successful_jobs}, "
+                   f"duration={datetime.now(UTC) - start_time}")
+        return successful_jobs > 0
+        
+    except Exception as db_error:
+        print(f"Database operation error: {str(db_error)}")
         return False
 
 def process_job_search(
     job_title: str,
     job_location: Optional[str] = None,
-    search_location: Optional[str] = None,
-    next_page_token: Optional[str] = None,
-) -> tuple[Optional[JobSearchResponse], bool]:
-    """
-    Execute complete job search workflow: fetch, parse, and store jobs.
+    max_page_depth: int = 1
+) -> Tuple[int, int, bool]:
+    total_jobs = 0
+    pages_processed = 0
+    storage_success = True
+    next_page_token = None
+    search_info = None
+    search_id = None  # Track the search ID across pages
     
-    This function orchestrates the entire job search process by:
-    1. Fetching raw data from the API
-    2. Parsing and validating the response
-    3. Storing results in MongoDB
-    
-    Args:
-        job_title (str): Job title or search query
-        job_location (Optional[str]): Location to include in search query
-        search_location (Optional[str]): Location parameter for API
-        next_page_token (Optional[str]): Token for pagination
-        
-    Returns:
-        tuple[Optional[JobSearchResponse], bool]: Tuple containing:
-            - Parsed job response (or None if failed)
-            - Boolean indicating if storage was successful
+    while pages_processed < max_page_depth:
+        try:
+            raw_response = fetch_jobs_from_api(
+                job_title=job_title,
+                job_location=job_location,
+                next_page_token=next_page_token
+            )
             
-    Example:
-        >>> response, success = process_job_search(
-        ...     job_title="Python Developer",
-        ...     job_location="San Francisco"
-        ... )
-        >>> if success:
-        ...     print(f"Found {len(response.jobs)} jobs")
-    """
-    raw_response = fetch_jobs_from_api(
-        job_title=job_title,
-        job_location=job_location,
-        search_location=search_location,
-        next_page_token=next_page_token
-    )
-    
-    if not raw_response:
-        return None, False
-        
-    parsed_response = parse_jobs_response(raw_response)
-    if not parsed_response:
-        return None, False
-        
-    return parsed_response, store_jobs_in_db(parsed_response)
+            if raw_response is None:
+                print("Failed to fetch response from API")
+                break
+            
+            # Store search_information from first page
+            if pages_processed == 0:
+                search_info = raw_response.get('search_information', {})
+                if 'search_metadata' not in raw_response:
+                    print("Invalid API response: missing search_metadata")
+                    break
+                search_id = raw_response['search_metadata']['id']
+            else:
+                raw_response['search_information'] = search_info
+                raw_response['is_subsequent_page'] = True
+            
+            parsed_response = JobSearchResponse(**raw_response)
+            
+            if not store_jobs_in_db(parsed_response, search_id):
+                storage_success = False
+            
+            total_jobs += len(parsed_response.jobs)
+            next_page_token = raw_response.get('pagination', {}).get('next_page_token')
+            print(f"Found {len(parsed_response.jobs)} jobs on this page")
+            print(f"Next page token: {next_page_token[:100] if next_page_token else 'None'}")
+            
+            if not next_page_token:
+                print("No more pages available")
+                break
+                
+            pages_processed += 1
+            
+            if pages_processed >= max_page_depth:
+                print(f"Reached max page depth of {max_page_depth}")
+                break
+                
+        except Exception as e:
+            print(f"Error processing page {pages_processed + 1}: {str(e)}")
+            break
+            
+    return total_jobs, pages_processed, storage_success
