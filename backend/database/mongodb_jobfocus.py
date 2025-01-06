@@ -57,6 +57,10 @@ class MongoDB:
             # Test connection
             self._client.admin.command('ping')
             logger.info("Successfully connected to MongoDB!")
+            
+            # Ensure indexes exist after successful connection
+            self.ensure_indexes()
+            
         except Exception as e:
             logger.error(f"Failed to connect to MongoDB: {str(e)}")
             logger.error(f"Error type: {type(e)}")
