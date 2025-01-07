@@ -3,18 +3,15 @@ from datetime import datetime, UTC
 import requests
 import os
 from dotenv import load_dotenv
-from logfire import Logfire
+from backend.utils.logger import logger
 from backend.database.mongodb_jobfocus import get_jobs_collection, get_searches_collection
 from backend.models.job_search_models import JobSearchResponse, JobSearchDocument
 from pydantic import ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Initialize logging
-logger = Logfire()
-
 @retry(
-    stop=stop_after_attempt(3),  # Give up after 3 attempts
-    wait=wait_exponential(multiplier=1, min=4, max=10)  # Wait 4-10 seconds between retries
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10)
 )
 def fetch_jobs_from_api(
     job_title: str,
@@ -59,15 +56,15 @@ def fetch_jobs_from_api(
         params['next_page_token'] = next_page_token
 
     try:
-        logger.info(f"Fetching jobs for query: {params['q']}")
+        logger.info("Fetching jobs", query=params['q'])
         response = requests.get(url, params=params)
         response.raise_for_status()
         
         return response.json()
         
     except requests.RequestException as e:
-        logger.error(f"API request failed: {str(e)}")
-        raise  # Tenacity will catch this and retry
+        logger.error("API request failed", error=str(e))
+        raise
 
 def parse_jobs_response(raw_response: Dict) -> Optional[JobSearchResponse]:
     """
