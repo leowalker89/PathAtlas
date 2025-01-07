@@ -107,7 +107,6 @@ def store_jobs_in_db(parsed_response: JobSearchResponse, search_id: Optional[str
         successful_jobs = 0
         job_ids = []
         
-        # Store individual jobs
         for job in parsed_response.jobs:
             try:
                 # Convert to dict and ensure URLs are strings
@@ -135,48 +134,19 @@ def store_jobs_in_db(parsed_response: JobSearchResponse, search_id: Optional[str
                 successful_jobs += 1
                 
             except Exception as e:
-                print(f"Error storing job {job.title}: {str(e)}")
+                logger.error("Error storing job", 
+                            job_title=job.title,
+                            error=str(e))
                 continue
         
-        # Handle search document
-        if not parsed_response.is_subsequent_page:
-            search_doc = JobSearchDocument(
-                search_metadata=parsed_response.search_metadata,
-                search_parameters=parsed_response.search_parameters,
-                search_information=parsed_response.search_information,
-                total_jobs=len(parsed_response.jobs),
-                pages_processed=1,
-                jobs=job_ids
-            )
-            search_dict = search_doc.model_dump()
-            # Convert URLs in metadata to strings
-            search_dict["search_metadata"]["request_url"] = str(search_doc.search_metadata.request_url)
-            search_dict["search_metadata"]["html_url"] = str(search_doc.search_metadata.html_url)
-            search_dict["search_metadata"]["json_url"] = str(search_doc.search_metadata.json_url)
-            
-            search_collection.insert_one(search_dict)
-        else:
-            search_collection.update_one(
-                {"search_metadata.id": search_id},
-                {
-                    "$inc": {
-                        "total_jobs": len(parsed_response.jobs),
-                        "pages_processed": 1
-                    },
-                    "$push": {"jobs": {"$each": job_ids}},
-                    "$set": {"updated_at": datetime.now(UTC)}
-                }
-            )
-        
-        print(f"Successfully stored {successful_jobs} jobs")
-        logger.info(f"Pipeline metrics: "
-                   f"processed={len(parsed_response.jobs)}, "
-                   f"stored={successful_jobs}, "
-                   f"duration={datetime.now(UTC) - start_time}")
+        logger.info("Storage metrics", 
+                   processed=len(parsed_response.jobs),
+                   stored=successful_jobs,
+                   duration=str(datetime.now(UTC) - start_time))
         return successful_jobs > 0
         
     except Exception as db_error:
-        print(f"Database operation error: {str(db_error)}")
+        logger.error("Database operation error", error=str(db_error))
         return False
 
 def process_job_search(
@@ -184,12 +154,34 @@ def process_job_search(
     job_location: Optional[str] = None,
     max_page_depth: int = 1
 ) -> Tuple[int, int, bool]:
+    """
+    Fetch and store jobs from SearchAPI.io with pagination support.
+
+    Args:
+        job_title: Search query for job title
+        job_location: Geographic location filter (optional)
+        max_page_depth: Maximum pages to fetch (default: 1)
+
+    Returns:
+        Tuple containing:
+        - Number of jobs processed
+        - Pages successfully fetched
+        - Storage success status
+
+    Example:
+        >>> total, pages, success = process_job_search("Python Developer", "New York")
+    """
     total_jobs = 0
     pages_processed = 0
     storage_success = True
     next_page_token = None
     search_info = None
-    search_id = None  # Track the search ID across pages
+    search_id = None
+
+    logger.info("Starting job search", 
+                job_title=job_title, 
+                location=job_location, 
+                max_pages=max_page_depth)
     
     while pages_processed < max_page_depth:
         try:
@@ -200,14 +192,13 @@ def process_job_search(
             )
             
             if raw_response is None:
-                print("Failed to fetch response from API")
+                logger.error("Failed to fetch response from API")
                 break
             
-            # Store search_information from first page
             if pages_processed == 0:
                 search_info = raw_response.get('search_information', {})
                 if 'search_metadata' not in raw_response:
-                    print("Invalid API response: missing search_metadata")
+                    logger.error("Invalid API response", error="missing search_metadata")
                     break
                 search_id = raw_response['search_metadata']['id']
             else:
@@ -218,24 +209,35 @@ def process_job_search(
             
             if not store_jobs_in_db(parsed_response, search_id):
                 storage_success = False
+                logger.warning("Failed to store some jobs", search_id=search_id)
             
             total_jobs += len(parsed_response.jobs)
             next_page_token = raw_response.get('pagination', {}).get('next_page_token')
-            print(f"Found {len(parsed_response.jobs)} jobs on this page")
-            print(f"Next page token: {next_page_token[:100] if next_page_token else 'None'}")
+            
+            logger.info("Page processed", 
+                       jobs_found=len(parsed_response.jobs),
+                       page_number=pages_processed + 1,
+                       has_next_page=bool(next_page_token))
             
             if not next_page_token:
-                print("No more pages available")
+                logger.info("No more pages available")
                 break
                 
             pages_processed += 1
             
             if pages_processed >= max_page_depth:
-                print(f"Reached max page depth of {max_page_depth}")
+                logger.info("Reached max page depth", max_depth=max_page_depth)
                 break
                 
         except Exception as e:
-            print(f"Error processing page {pages_processed + 1}: {str(e)}")
+            logger.error("Error processing page", 
+                        page_number=pages_processed + 1,
+                        error=str(e))
             break
+    
+    logger.info("Job search completed", 
+                total_jobs=total_jobs,
+                pages_processed=pages_processed,
+                storage_success=storage_success)
             
     return total_jobs, pages_processed, storage_success
